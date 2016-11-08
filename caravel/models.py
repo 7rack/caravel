@@ -4,9 +4,12 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+from collections import OrderedDict
 import functools
 import json
 import logging
+import pickle
+import re
 import textwrap
 from collections import namedtuple
 from copy import deepcopy, copy
@@ -16,10 +19,13 @@ import humanize
 import pandas as pd
 import requests
 import sqlalchemy as sqla
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.orm import subqueryload
+
 import sqlparse
 from dateutil.parser import parse
 
-from flask import request, g
+from flask import escape, g, Markup, request
 from flask_appbuilder import Model
 from flask_appbuilder.models.mixins import AuditMixin
 from flask_appbuilder.models.decorators import renders
@@ -30,23 +36,35 @@ from pydruid.utils.filters import Dimension, Filter
 from pydruid.utils.postaggregator import Postaggregator
 from pydruid.utils.having import Aggregation
 from six import string_types
+
 from sqlalchemy import (
-    Column, Integer, String, ForeignKey, Text, Boolean, DateTime, Date,
-    Table, create_engine, MetaData, desc, asc, select, and_, func)
-from sqlalchemy.engine import reflection
+    Column, Integer, String, ForeignKey, Text, Boolean,
+    DateTime, Date, Table, Numeric,
+    create_engine, MetaData, desc, asc, select, and_, func
+)
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.declarative import declared_attr
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import backref, relationship
+from sqlalchemy.orm.session import make_transient
 from sqlalchemy.sql import table, literal_column, text, column
+from sqlalchemy.sql.expression import ColumnClause, TextAsFrom
 from sqlalchemy_utils import EncryptedType
 
+from werkzeug.datastructures import ImmutableMultiDict
+
 import caravel
-from caravel import app, db, get_session, utils, sm
+from caravel import app, db, db_engine_specs, get_session, utils, sm
+from caravel.source_registry import SourceRegistry
 from caravel.viz import viz_types
-from caravel.utils import flasher, MetricPermException, DimSelector
+from caravel.jinja_context import get_template_processor
+from caravel.utils import (
+    flasher, MetricPermException, DimSelector, wrap_clause_in_parens
+)
 
 config = app.config
 
 QueryResult = namedtuple('namedtuple', ['df', 'query', 'duration'])
+FillterPattern = re.compile(r'''((?:[^,"']|"[^"]*"|'[^']*')+)''')
 
 
 class JavascriptPostAggregator(Postaggregator):
@@ -58,6 +76,31 @@ class JavascriptPostAggregator(Postaggregator):
             'function': function,
         }
         self.name = name
+
+
+class ImportMixin(object):
+    def override(self, obj):
+        """Overrides the plain fields of the dashboard."""
+        for field in obj.__class__.export_fields:
+            setattr(self, field, getattr(obj, field))
+
+    def copy(self):
+        """Creates a copy of the dashboard without relationships."""
+        new_obj = self.__class__()
+        new_obj.override(self)
+        return new_obj
+
+    def alter_params(self, **kwargs):
+        d = self.params_dict
+        d.update(kwargs)
+        self.params = json.dumps(d)
+
+    @property
+    def params_dict(self):
+        if self.params:
+            return json.loads(self.params)
+        else:
+            return {}
 
 
 class AuditMixinNullable(AuditMixin):
@@ -93,12 +136,13 @@ class AuditMixinNullable(AuditMixin):
 
     @renders('changed_on')
     def changed_on_(self):
-        return '<span class="no-wrap">{}</span>'.format(self.changed_on)
+        return Markup(
+            '<span class="no-wrap">{}</span>'.format(self.changed_on))
 
     @renders('changed_on')
     def modified(self):
         s = humanize.naturaltime(datetime.now() - self.changed_on)
-        return '<span class="no-wrap">{}</nobr>'.format(s)
+        return Markup('<span class="no-wrap">{}</span>'.format(s))
 
     @property
     def icons(self):
@@ -138,15 +182,14 @@ slice_user = Table('slice_user', Model.metadata,
 )
 
 
-class Slice(Model, AuditMixinNullable):
+class Slice(Model, AuditMixinNullable, ImportMixin):
 
     """A slice is essentially a report or a view on data"""
 
     __tablename__ = 'slices'
     id = Column(Integer, primary_key=True)
     slice_name = Column(String(250))
-    druid_datasource_id = Column(Integer, ForeignKey('datasources.id'))
-    table_id = Column(Integer, ForeignKey('tables.id'))
+    datasource_id = Column(Integer)
     datasource_type = Column(String(200))
     datasource_name = Column(String(2000))
     viz_type = Column(String(250))
@@ -154,33 +197,39 @@ class Slice(Model, AuditMixinNullable):
     description = Column(Text)
     cache_timeout = Column(Integer)
     perm = Column(String(2000))
-
-    table = relationship(
-        'SqlaTable', foreign_keys=[table_id], backref='slices')
-    druid_datasource = relationship(
-        'DruidDatasource', foreign_keys=[druid_datasource_id], backref='slices')
     owners = relationship("User", secondary=slice_user)
+
+    export_fields = ('slice_name', 'datasource_type', 'datasource_name',
+                     'viz_type', 'params', 'cache_timeout')
 
     def __repr__(self):
         return self.slice_name
 
     @property
+    def cls_model(self):
+        return SourceRegistry.sources[self.datasource_type]
+
+    @property
     def datasource(self):
-        return self.table or self.druid_datasource
+        return self.get_datasource
+
+    @datasource.getter
+    @utils.memoized
+    def get_datasource(self):
+        ds = db.session.query(
+            self.cls_model).filter_by(
+            id=self.datasource_id).first()
+        return ds
 
     @renders('datasource_name')
     def datasource_link(self):
-        if self.table:
-            return self.table.link
-        elif self.druid_datasource:
-            return self.druid_datasource.link
+        datasource = self.datasource
+        if datasource:
+            return self.datasource.link
 
     @property
     def datasource_edit_url(self):
-        if self.table:
-            return self.table.url
-        elif self.druid_datasource:
-            return self.druid_datasource.url
+        self.datasource.url
 
     @property
     @utils.memoized
@@ -192,10 +241,6 @@ class Slice(Model, AuditMixinNullable):
     @property
     def description_markeddown(self):
         return utils.markdown(self.description)
-
-    @property
-    def datasource_id(self):
-        return self.table_id or self.druid_datasource_id
 
     @property
     def data(self):
@@ -237,23 +282,89 @@ class Slice(Model, AuditMixinNullable):
         return href(slice_params)
 
     @property
+    def slice_id_url(self):
+        return (
+            "/caravel/{slc.datasource_type}/{slc.datasource_id}/{slc.id}/"
+        ).format(slc=self)
+
+    @property
     def edit_url(self):
         return "/slicemodelview/edit/{}".format(self.id)
 
     @property
     def slice_link(self):
         url = self.slice_url
-        return '<a href="{url}">{obj.slice_name}</a>'.format(
-            url=url, obj=self)
+        name = escape(self.slice_name)
+        return Markup('<a href="{url}">{name}</a>'.format(**locals()))
+
+    def get_viz(self, url_params_multidict=None):
+        """Creates :py:class:viz.BaseViz object from the url_params_multidict.
+
+        :param werkzeug.datastructures.MultiDict url_params_multidict:
+            Contains the visualization params, they override the self.params
+            stored in the database
+        :return: object of the 'viz_type' type that is taken from the
+            url_params_multidict or self.params.
+        :rtype: :py:class:viz.BaseViz
+        """
+        slice_params = json.loads(self.params)  # {}
+        slice_params['slice_id'] = self.id
+        slice_params['json'] = "false"
+        slice_params['slice_name'] = self.slice_name
+        slice_params['viz_type'] = self.viz_type if self.viz_type else "table"
+        if url_params_multidict:
+            slice_params.update(url_params_multidict)
+            to_del = [k for k in slice_params if k not in url_params_multidict]
+            for k in to_del:
+                del slice_params[k]
+
+        immutable_slice_params = ImmutableMultiDict(slice_params)
+        return viz_types[immutable_slice_params.get('viz_type')](
+            self.datasource,
+            form_data=immutable_slice_params,
+            slice_=self
+        )
+
+    @classmethod
+    def import_obj(cls, slc_to_import, import_time=None):
+        """Inserts or overrides slc in the database.
+
+        remote_id and import_time fields in params_dict are set to track the
+        slice origin and ensure correct overrides for multiple imports.
+        Slice.perm is used to find the datasources and connect them.
+        """
+        session = db.session
+        make_transient(slc_to_import)
+        slc_to_import.dashboards = []
+        slc_to_import.alter_params(
+            remote_id=slc_to_import.id, import_time=import_time)
+
+        # find if the slice was already imported
+        slc_to_override = None
+        for slc in session.query(Slice).all():
+            if ('remote_id' in slc.params_dict and
+                    slc.params_dict['remote_id'] == slc_to_import.id):
+                slc_to_override = slc
+
+        slc_to_import = slc_to_import.copy()
+        params = slc_to_import.params_dict
+        slc_to_import.datasource_id = SourceRegistry.get_datasource_by_name(
+            session, slc_to_import.datasource_type, params['datasource_name'],
+            params['schema'], params['database_name']).id
+        if slc_to_override:
+            slc_to_override.override(slc_to_import)
+            session.flush()
+            return slc_to_override.id
+        else:
+            session.add(slc_to_import)
+            logging.info('Final slice: {}'.format(slc_to_import.to_json()))
+            session.flush()
+            return slc_to_import.id
 
 
 def set_perm(mapper, connection, target):  # noqa
-    if target.table_id:
-        src_class = SqlaTable
-        id_ = target.table_id
-    elif target.druid_datasource_id:
-        src_class = DruidDatasource
-        id_ = target.druid_datasource_id
+    src_class = target.cls_model
+    id_ = target.datasource_id
     ds = db.session.query(src_class).filter_by(id=int(id_)).first()
     target.perm = ds.perm
 
@@ -276,7 +387,7 @@ dashboard_user = Table(
 )
 
 
-class Dashboard(Model, AuditMixinNullable):
+class Dashboard(Model, AuditMixinNullable, ImportMixin):
 
     """The dashboard object!"""
 
@@ -292,6 +403,9 @@ class Dashboard(Model, AuditMixinNullable):
         'Slice', secondary=dashboard_slices, backref='dashboards')
     owners = relationship("User", secondary=dashboard_user)
 
+    export_fields = ('dashboard_title', 'position_json', 'json_metadata',
+                     'description', 'css', 'slug')
+
     def __repr__(self):
         return self.dashboard_title
 
@@ -304,26 +418,182 @@ class Dashboard(Model, AuditMixinNullable):
         return "/caravel/dashboard/{}/".format(self.slug or self.id)
 
     @property
-    def metadata_dejson(self):
-        if self.json_metadata:
-            return json.loads(self.json_metadata)
-        else:
-            return {}
+    def datasources(self):
+        return {slc.datasource for slc in self.slices}
+
+    @property
+    def sqla_metadata(self):
+        metadata = MetaData(bind=self.get_sqla_engine())
+        return metadata.reflect()
 
     def dashboard_link(self):
-        return '<a href="{obj.url}">{obj.dashboard_title}</a>'.format(obj=self)
+        title = escape(self.dashboard_title)
+        return Markup(
+            '<a href="{self.url}">{title}</a>'.format(**locals()))
 
     @property
     def json_data(self):
         d = {
             'id': self.id,
-            'metadata': self.metadata_dejson,
+            'metadata': self.params_dict,
             'dashboard_title': self.dashboard_title,
             'slug': self.slug,
             'slices': [slc.data for slc in self.slices],
             'position_json': json.loads(self.position_json) if self.position_json else [],
         }
         return json.dumps(d)
+
+    @property
+    def params(self):
+        return self.json_metadata
+
+    @params.setter
+    def params(self, value):
+        self.json_metadata = value
+
+    @property
+    def position_array(self):
+        if self.position_json:
+            return json.loads(self.position_json)
+        return []
+
+    @classmethod
+    def import_obj(cls, dashboard_to_import, import_time=None):
+        """Imports the dashboard from the object to the database.
+
+         Once dashboard is imported, json_metadata field is extended and stores
+         remote_id and import_time. It helps to decide if the dashboard has to
+         be overridden or just copies over. Slices that belong to this
+         dashboard will be wired to existing tables. This function can be used
+         to import/export dashboards between multiple caravel instances.
+         Audit metadata isn't copies over.
+        """
+        def alter_positions(dashboard, old_to_new_slc_id_dict):
+            """ Updates slice_ids in the position json.
+
+            Sample position json:
+            [{
+                "col": 5,
+                "row": 10,
+                "size_x": 4,
+                "size_y": 2,
+                "slice_id": "3610"
+            }]
+            """
+            position_array = dashboard.position_array
+            for position in position_array:
+                if 'slice_id' not in position:
+                    continue
+                old_slice_id = int(position['slice_id'])
+                if old_slice_id in old_to_new_slc_id_dict:
+                    position['slice_id'] = '{}'.format(
+                        old_to_new_slc_id_dict[old_slice_id])
+            dashboard.position_json = json.dumps(position_array)
+
+        logging.info('Started import of the dashboard: {}'
+                     .format(dashboard_to_import.to_json()))
+        session = db.session
+        logging.info('Dashboard has {} slices'
+                     .format(len(dashboard_to_import.slices)))
+        # copy slices object as Slice.import_slice will mutate the slice
+        # and will remove the existing dashboard - slice association
+        slices = copy(dashboard_to_import.slices)
+        old_to_new_slc_id_dict = {}
+        new_filter_immune_slices = []
+        new_expanded_slices = {}
+        i_params_dict = dashboard_to_import.params_dict
+        for slc in slices:
+            logging.info('Importing slice {} from the dashboard: {}'.format(
+                slc.to_json(), dashboard_to_import.dashboard_title))
+            new_slc_id = Slice.import_obj(slc, import_time=import_time)
+            old_to_new_slc_id_dict[slc.id] = new_slc_id
+            # update json metadata that deals with slice ids
+            new_slc_id_str = '{}'.format(new_slc_id)
+            old_slc_id_str = '{}'.format(slc.id)
+            if ('filter_immune_slices' in i_params_dict and
+                    old_slc_id_str in i_params_dict['filter_immune_slices']):
+                new_filter_immune_slices.append(new_slc_id_str)
+            if ('expanded_slices' in i_params_dict and
+                    old_slc_id_str in i_params_dict['expanded_slices']):
+                new_expanded_slices[new_slc_id_str] = (
+                    i_params_dict['expanded_slices'][old_slc_id_str])
+
+        # override the dashboard
+        existing_dashboard = None
+        for dash in session.query(Dashboard).all():
+            if ('remote_id' in dash.params_dict and
+                    dash.params_dict['remote_id'] ==
+                    dashboard_to_import.id):
+                existing_dashboard = dash
+
+        dashboard_to_import.id = None
+        alter_positions(dashboard_to_import, old_to_new_slc_id_dict)
+        dashboard_to_import.alter_params(import_time=import_time)
+        if new_expanded_slices:
+            dashboard_to_import.alter_params(
+                expanded_slices=new_expanded_slices)
+        if new_filter_immune_slices:
+            dashboard_to_import.alter_params(
+                filter_immune_slices=new_filter_immune_slices)
+
+        new_slices = session.query(Slice).filter(
+            Slice.id.in_(old_to_new_slc_id_dict.values())).all()
+
+        if existing_dashboard:
+            existing_dashboard.override(dashboard_to_import)
+            existing_dashboard.slices = new_slices
+            session.flush()
+            return existing_dashboard.id
+        else:
+            # session.add(dashboard_to_import) causes sqlachemy failures
+            # related to the attached users / slices. Creating new object
+            # allows to avoid conflicts in the sql alchemy state.
+            copied_dash = dashboard_to_import.copy()
+            copied_dash.slices = new_slices
+            session.add(copied_dash)
+            session.flush()
+            return copied_dash.id
+
+    @classmethod
+    def export_dashboards(cls, dashboard_ids):
+        copied_dashboards = []
+        datasource_ids = set()
+        for dashboard_id in dashboard_ids:
+            # make sure that dashboard_id is an integer
+            dashboard_id = int(dashboard_id)
+            copied_dashboard = (
+                db.session.query(Dashboard)
+                .options(subqueryload(Dashboard.slices))
+                .filter_by(id=dashboard_id).first()
+            )
+            make_transient(copied_dashboard)
+            for slc in copied_dashboard.slices:
+                datasource_ids.add((slc.datasource_id, slc.datasource_type))
+                # add extra params for the import
+                slc.alter_params(
+                    remote_id=slc.id,
+                    datasource_name=slc.datasource.name,
+                    schema=slc.datasource.name,
+                    database_name=slc.datasource.database.database_name,
+                )
+            copied_dashboard.alter_params(remote_id=dashboard_id)
+            copied_dashboards.append(copied_dashboard)
+
+            eager_datasources = []
+            for dashboard_id, dashboard_type in datasource_ids:
+                eager_datasource = SourceRegistry.get_eager_datasource(
+                    db.session, dashboard_type, dashboard_id)
+                eager_datasource.alter_params(
+                    remote_id=eager_datasource.id,
+                    database_name=eager_datasource.database.database_name,
+                )
+                make_transient(eager_datasource)
+                eager_datasources.append(eager_datasource)
+
+        return pickle.dumps({
+            'dashboards': copied_dashboards,
+            'datasources': eager_datasources,
+        })
 
 
 class Queryable(object):
@@ -362,17 +632,24 @@ class Queryable(object):
             return "/caravel/explore/{obj.type}/{obj.id}/".format(obj=self)
 
 
-
 class Database(Model, AuditMixinNullable):
 
     """An ORM object that stores Database related information"""
 
     __tablename__ = 'dbs'
+
     id = Column(Integer, primary_key=True)
     database_name = Column(String(250), unique=True)
     sqlalchemy_uri = Column(String(1024))
     password = Column(EncryptedType(String(1024), config.get('SECRET_KEY')))
     cache_timeout = Column(Integer)
+    select_as_create_table_as = Column(Boolean, default=False)
+    expose_in_sqllab = Column(Boolean, default=False)
+    allow_run_sync = Column(Boolean, default=True)
+    allow_run_async = Column(Boolean, default=False)
+    allow_ctas = Column(Boolean, default=False)
+    allow_dml = Column(Boolean, default=False)
+    force_ctas_schema = Column(String(250))
     extra = Column(Text, default=textwrap.dedent("""\
     {
         "metadata_params": {},
@@ -383,13 +660,112 @@ class Database(Model, AuditMixinNullable):
     def __repr__(self):
         return self.database_name
 
-    def get_sqla_engine(self):
+    @property
+    def name(self):
+        return self.database_name
+
+    @property
+    def backend(self):
+        url = make_url(self.sqlalchemy_uri_decrypted)
+        return url.get_backend_name()
+
+    def set_sqlalchemy_uri(self, uri):
+        password_mask = "X" * 10
+        conn = sqla.engine.url.make_url(uri)
+        if conn.password != password_mask:
+            # do not over-write the password with the password mask
+            self.password = conn.password
+        conn.password = password_mask if conn.password else None
+        self.sqlalchemy_uri = str(conn)  # hides the password
+
+    def get_sqla_engine(self, schema=None):
         extra = self.get_extra()
+        url = make_url(self.sqlalchemy_uri_decrypted)
         params = extra.get('engine_params', {})
-        return create_engine(self.sqlalchemy_uri_decrypted, **params)
+        if self.backend == 'presto' and schema:
+            if '/' in url.database:
+                url.database = url.database.split('/')[0] + '/' + schema
+            else:
+                url.database += '/' + schema
+        elif schema:
+            url.database = schema
+        return create_engine(url, **params)
+
+    def get_reserved_words(self):
+        return self.get_sqla_engine().dialect.preparer.reserved_words
+
+    def get_quoter(self):
+        return self.get_sqla_engine().dialect.identifier_preparer.quote
+
+    def get_df(self, sql, schema):
+        sql = sql.strip().strip(';')
+        eng = self.get_sqla_engine(schema=schema)
+        cur = eng.execute(sql, schema=schema)
+        cols = [col[0] for col in cur.cursor.description]
+        df = pd.DataFrame(cur.fetchall(), columns=cols)
+        return df
+
+    def compile_sqla_query(self, qry, schema=None):
+        eng = self.get_sqla_engine(schema=schema)
+        compiled = qry.compile(eng, compile_kwargs={"literal_binds": True})
+        return '{}'.format(compiled)
+
+    def select_star(
+            self, table_name, schema=None, limit=100, show_cols=False,
+            indent=True):
+        """Generates a ``select *`` statement in the proper dialect"""
+        for i in range(10):
+            print(schema)
+        quote = self.get_quoter()
+        fields = '*'
+        table = self.get_table(table_name, schema=schema)
+        if show_cols:
+            fields = [quote(c.name) for c in table.columns]
+        if schema:
+            table_name = schema + '.' + table_name
+        qry = select(fields).select_from(text(table_name))
+        if limit:
+            qry = qry.limit(limit)
+        sql = self.compile_sqla_query(qry)
+        if indent:
+            sql = sqlparse.format(sql, reindent=True)
+        return sql
+
+    def wrap_sql_limit(self, sql, limit=1000):
+        qry = (
+            select('*')
+            .select_from(TextAsFrom(text(sql), ['*'])
+            .alias('inner_qry')).limit(limit)
+        )
+        return self.compile_sqla_query(qry)
 
     def safe_sqlalchemy_uri(self):
         return self.sqlalchemy_uri
+
+    @property
+    def inspector(self):
+        engine = self.get_sqla_engine()
+        return sqla.inspect(engine)
+
+    def all_table_names(self, schema=None):
+        return sorted(self.inspector.get_table_names(schema))
+
+    def all_view_names(self, schema=None):
+        views = []
+        try:
+            views = self.inspector.get_view_names(schema)
+        except Exception as e:
+            pass
+        return views
+
+    def all_schema_names(self):
+        return sorted(self.inspector.get_schema_names())
+
+    @property
+    def db_engine_spec(self):
+        engine_name = self.get_sqla_engine().name or 'base'
+        return db_engine_specs.engines.get(
+            engine_name, db_engine_specs.BaseEngineSpec)
 
     def grains(self):
         """Defines time granularity database-specific expressions.
@@ -400,55 +776,7 @@ class Database(Model, AuditMixinNullable):
         each database has slightly different but similar datetime functions,
         this allows a mapping between database engines and actual functions.
         """
-        Grain = namedtuple('Grain', 'name label function')
-        db_time_grains = {
-            'presto': (
-                Grain('Time Column', _('Time Column'), '{col}'),
-                Grain('week', _('week'), "date_trunc('week', CAST({col} AS DATE))"),
-                Grain('month', _('month'), "date_trunc('month', CAST({col} AS DATE))"),
-                Grain('quarter', _('quarter'), "date_trunc('quarter', CAST({col} AS DATE))"),
-                Grain("week_ending_saturday", _('week_ending_saturday'), "date_add('day', 5, "
-                      "date_trunc('week', date_add('day', 1, CAST({col} AS DATE))))"),
-                Grain("week_start_sunday", _('week_start_sunday'), "date_add('day', -1, "
-                      "date_trunc('week', date_add('day', 1, CAST({col} AS DATE))))")
-            ),
-            'mysql': (
-                Grain('Time Column', _('Time Column'), '{col}'),
-                Grain("second", _('second'), "DATE_ADD(DATE({col}), "
-                      "INTERVAL (HOUR({col})*60*60 + MINUTE({col})*60"
-                      " + SECOND({col})) SECOND)"),
-                Grain("minute", _('minute'), "DATE_ADD(DATE({col}), "
-                      "INTERVAL (HOUR({col})*60 + MINUTE({col})) MINUTE)"),
-                Grain("hour", _('hour'), "DATE_ADD(DATE({col}), "
-                      "INTERVAL HOUR({col}) HOUR)"),
-                Grain('day', _('day'), 'DATE({col})'),
-                Grain("week", _('week'), "DATE(DATE_SUB({col}, "
-                      "INTERVAL DAYOFWEEK({col}) - 1 DAY))"),
-                Grain("month", _('month'), "DATE(DATE_SUB({col}, "
-                      "INTERVAL DAYOFMONTH({col}) - 1 DAY))"),
-            ),
-            'sqlite': (
-                Grain('Time Column', _('Time Column'), '{col}'),
-                Grain('day', _('day'), 'DATE({col})'),
-                Grain("week", _('week'), "DATE({col}, -strftime('%w', {col}) || ' days')"),
-                Grain("month", _('month'), "DATE({col}, -strftime('%d', {col}) || ' days')"),
-            ),
-            'postgresql': (
-                Grain("Time Column", _('Time Column'), "{col}"),
-                Grain("second", _('second'), "DATE_TRUNC('second', {col})"),
-                Grain("minute", _('minute'), "DATE_TRUNC('minute', {col})"),
-                Grain("hour", _('hour'), "DATE_TRUNC('hour', {col})"),
-                Grain("day", _('day'), "DATE_TRUNC('day', {col})"),
-                Grain("week", _('week'), "DATE_TRUNC('week', {col})"),
-                Grain("month", _('month'), "DATE_TRUNC('month', {col})"),
-                Grain("year", _('year'), "DATE_TRUNC('year', {col})"),
-            ),
-        }
-        db_time_grains['redshift'] = db_time_grains['postgresql']
-        db_time_grains['vertica'] = db_time_grains['postgresql']
-        for db_type, grains in db_time_grains.items():
-            if self.sqlalchemy_uri.startswith(db_type):
-                return grains
+        return self.db_engine_spec.time_grains
 
     def grains_dict(self):
         return {grain.name: grain for grain in self.grains()}
@@ -471,10 +799,17 @@ class Database(Model, AuditMixinNullable):
             autoload=True,
             autoload_with=self.get_sqla_engine())
 
-    def get_columns(self, table_name):
-        engine = self.get_sqla_engine()
-        insp = reflection.Inspector.from_engine(engine)
-        return insp.get_columns(table_name)
+    def get_columns(self, table_name, schema=None):
+        return self.inspector.get_columns(table_name, schema)
+
+    def get_indexes(self, table_name, schema=None):
+        return self.inspector.get_indexes(table_name, schema)
+
+    def get_pk_constraint(self, table_name, schema=None):
+        return self.inspector.get_pk_constraint(table_name, schema)
+
+    def get_foreign_keys(self, table_name, schema=None):
+        return self.inspector.get_foreign_keys(table_name, schema)
 
     @property
     def sqlalchemy_uri_decrypted(self):
@@ -487,11 +822,12 @@ class Database(Model, AuditMixinNullable):
         return '/caravel/sql/{}/'.format(self.id)
 
     @property
-    def sql_link(self):
-        return '<a href="{}">SQL</a>'.format(self.sql_url)
+    def perm(self):
+        return (
+            "[{obj.database_name}].(id:{obj.id})").format(obj=self)
 
 
-class SqlaTable(Model, Queryable, AuditMixinNullable):
+class SqlaTable(Model, Queryable, AuditMixinNullable, ImportMixin):
 
     """An ORM object for SqlAlchemy table references"""
 
@@ -508,19 +844,25 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
     user_id = Column(Integer, ForeignKey('ab_user.id'))
     owner = relationship('User', backref='tables', foreign_keys=[user_id])
     database = relationship(
-        'Database', backref='tables', foreign_keys=[database_id])
+        'Database',
+        backref=backref('tables', cascade='all, delete-orphan'),
+        foreign_keys=[database_id])
     offset = Column(Integer, default=0)
     cache_timeout = Column(Integer)
     schema = Column(String(255))
-    table_columns = relationship("TableColumn", back_populates="table")
+    sql = Column(Text)
+    params = Column(Text)
 
     baselink = "tablemodelview"
+    export_fields = (
+        'table_name', 'main_dttm_col', 'description', 'default_endpoint',
+        'database_id', 'is_featured', 'offset', 'cache_timeout', 'schema',
+        'sql', 'params')
 
     __table_args__ = (
         sqla.UniqueConstraint(
             'database_id', 'schema', 'table_name',
             name='_customer_location_uc'),)
-
 
     def __repr__(self):
         return self.table_name
@@ -531,7 +873,9 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
 
     @property
     def link(self):
-        return '<a href="{self.url}">{self.table_name}</a>'.format(**locals())
+        table_name = escape(self.table_name)
+        return Markup(
+            '<a href="{self.explore_url}">{table_name}</a>'.format(**locals()))
 
     @property
     def perm(self):
@@ -540,8 +884,13 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
             "(id:{obj.id})").format(obj=self)
 
     @property
+    def name(self):
+        return self.table_name
+
+    @property
     def full_name(self):
-        return "[{obj.database}].[{obj.table_name}]".format(obj=self)
+        return utils.get_datasource_full_name(
+            self.database, self.table_name, schema=self.schema)
 
     @property
     def dttm_cols(self):
@@ -572,14 +921,6 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
                 "table-condensed"))
 
     @property
-    def name(self):
-        return self.table_name
-
-    @renders('table_name')
-    def table_link(self):
-        return '<a href="{obj.explore_url}">{obj.table_name}</a>'.format(obj=self)
-
-    @property
     def metrics_combo(self):
         return sorted(
             [
@@ -592,11 +933,14 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
         return self.database.sql_url + "?table_name=" + str(self.table_name)
 
     @property
-    def sql_link(self):
-        return '<a href="{}">SQL</a>'.format(self.sql_url)
+    def time_column_grains(self):
+        return {
+            "time_columns": self.dttm_cols,
+            "time_grains": [grain.name for grain in self.database.grains()]
+        }
 
     def get_col(self, col_name):
-        columns = self.table_columns
+        columns = self.columns
         for col in columns:
             if col_name == col.column_name:
                 return col
@@ -607,12 +951,18 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
             from_dttm, to_dttm,
             filter=None,  # noqa
             is_timeseries=True,
-            timeseries_limit=15, row_limit=None,
-            inner_from_dttm=None, inner_to_dttm=None,
+            timeseries_limit=15,
+            timeseries_limit_metric=None,
+            row_limit=None,
+            inner_from_dttm=None,
+            inner_to_dttm=None,
             orderby=None,
             extras=None,
             columns=None):
         """Querying any sqla table from this common interface"""
+        template_processor = get_template_processor(
+            table=self, database=self.database)
+
         # For backward compatibility
         if granularity not in self.dttm_cols:
             granularity = self.main_dttm_col
@@ -627,7 +977,11 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
                 "and is required by this type of chart"))
 
         metrics_exprs = [metrics_dict.get(m).sqla_col for m in metrics]
-
+        timeseries_limit_metric = metrics_dict.get(timeseries_limit_metric)
+        timeseries_limit_metric_expr = None
+        if timeseries_limit_metric:
+            timeseries_limit_metric_expr = \
+                timeseries_limit_metric.sqla_col
         if metrics:
             main_metric_expr = metrics_exprs[0]
         else:
@@ -655,6 +1009,22 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
             metrics_exprs = []
 
         if granularity:
+
+            # TODO: sqlalchemy 1.2 release should be doing this on its own.
+            # Patch only if the column clause is specific for DateTime set and
+            # granularity is selected.
+            @compiles(ColumnClause)
+            def visit_column(element, compiler, **kw):
+                text = compiler.visit_column(element, **kw)
+                try:
+                    if element.is_literal and hasattr(element.type, 'python_type') and \
+                            type(element.type) is DateTime:
+
+                        text = text.replace('%%', '%')
+                except NotImplementedError:
+                    pass  # Some elements raise NotImplementedError for python_type
+                return text
+
             dttm_col = cols[granularity]
             dttm_expr = dttm_col.sqla_col.label('timestamp')
             timestamp = dttm_expr
@@ -662,9 +1032,16 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
             # Transforming time grain into an expression based on configuration
             time_grain_sqla = extras.get('time_grain_sqla')
             if time_grain_sqla:
+                db_engine_spec = self.database.db_engine_spec
+                if dttm_col.python_date_format == 'epoch_s':
+                    dttm_expr = \
+                        db_engine_spec.epoch_to_dttm().format(col=dttm_expr)
+                elif dttm_col.python_date_format == 'epoch_ms':
+                    dttm_expr = \
+                        db_engine_spec.epoch_ms_to_dttm().format(col=dttm_expr)
                 udf = self.database.grains_dict().get(time_grain_sqla, '{col}')
                 timestamp_grain = literal_column(
-                    udf.function.format(col=dttm_expr)).label('timestamp')
+                    udf.function.format(col=dttm_expr), type_=DateTime).label('timestamp')
             else:
                 timestamp_grain = timestamp
 
@@ -696,6 +1073,10 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
         if self.schema:
             tbl.schema = self.schema
 
+        # Supporting arbitrary SQL statements in place of tables
+        if self.sql:
+            tbl = TextAsFrom(sqla.text(self.sql), []).alias('expr_qry')
+
         if not columns:
             qry = qry.group_by(*groupby_exprs)
 
@@ -704,15 +1085,21 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
         for col, op, eq in filter:
             col_obj = cols[col]
             if op in ('in', 'not in'):
-                values = eq.split(",")
+                splitted = FillterPattern.split(eq)[1::2]
+                values = [types.replace("'", '').strip() for types in splitted]
                 cond = col_obj.sqla_col.in_(values)
                 if op == 'not in':
                     cond = ~cond
                 where_clause_and.append(cond)
-        if extras and 'where' in extras:
-            where_clause_and += [text(extras['where'])]
-        if extras and 'having' in extras:
-            having_clause_and += [text(extras['having'])]
+        if extras:
+            where = extras.get('where')
+            if where:
+                where_clause_and += [wrap_clause_in_parens(
+                    template_processor.process_template(where))]
+            having = extras.get('having')
+            if having:
+                having_clause_and += [wrap_clause_in_parens(
+                    template_processor.process_template(having))]
         if granularity:
             qry = qry.where(and_(*(time_filter + where_clause_and)))
         else:
@@ -728,11 +1115,17 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
         qry = qry.limit(row_limit)
 
         if timeseries_limit and groupby:
+            # some sql dialects require for order by expressions
+            # to also be in the select clause
+            inner_select_exprs += [main_metric_expr]
             subq = select(inner_select_exprs)
             subq = subq.select_from(tbl)
             subq = subq.where(and_(*(where_clause_and + inner_time_filter)))
             subq = subq.group_by(*inner_groupby_exprs)
-            subq = subq.order_by(desc(main_metric_expr))
+            ob = main_metric_expr
+            if timeseries_limit_metric_expr is not None:
+                ob = timeseries_limit_metric_expr
+            subq = subq.order_by(desc(ob))
             subq = subq.limit(timeseries_limit)
             on_clause = []
             for i, gb in enumerate(groupby):
@@ -747,7 +1140,7 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
         sql = "{}".format(
             qry.compile(
                 engine, compile_kwargs={"literal_binds": True},),
-            )
+        )
         df = pd.read_sql_query(
             sql=sql,
             con=engine
@@ -756,16 +1149,17 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
         return QueryResult(
             df=df, duration=datetime.now() - qry_start_dttm, query=sql)
 
+    def get_sqla_table_object(self):
+        return self.database.get_table(self.table_name, schema=self.schema)
+
     def fetch_metadata(self):
         """Fetches the metadata for the table and merges it in"""
         try:
-            table = self.database.get_table(self.table_name, schema=self.schema)
-        except Exception as e:
-            flasher(str(e))
-            flasher(
+            table = self.get_sqla_table_object()
+        except Exception:
+            raise Exception(
                 "Table doesn't seem to exist in the specified database, "
-                "couldn't fetch column information", "danger")
-            return
+                "couldn't fetch column information")
 
         TC = TableColumn  # noqa shortcut to class
         M = SqlMetric  # noqa
@@ -792,6 +1186,7 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
                 dbcol.groupby = dbcol.is_string
                 dbcol.filterable = dbcol.is_string
                 dbcol.sum = dbcol.isnum
+                dbcol.avg = dbcol.isnum
                 dbcol.is_dttm = dbcol.is_time
 
             db.session.merge(self)
@@ -808,6 +1203,13 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
                     verbose_name='sum__' + dbcol.column_name,
                     metric_type='sum',
                     expression="SUM({})".format(quoted)
+                ))
+            if dbcol.avg:
+                metrics.append(M(
+                    metric_name='avg__' + dbcol.column_name,
+                    verbose_name='avg__' + dbcol.column_name,
+                    metric_type='avg',
+                    expression="AVG({})".format(quoted)
                 ))
             if dbcol.max:
                 metrics.append(M(
@@ -854,8 +1256,67 @@ class SqlaTable(Model, Queryable, AuditMixinNullable):
         if not self.main_dttm_col:
             self.main_dttm_col = any_date_col
 
+    @classmethod
+    def import_obj(cls, datasource_to_import, import_time=None):
+        """Imports the datasource from the object to the database.
 
-class SqlMetric(Model, AuditMixinNullable):
+         Metrics and columns and datasource will be overrided if exists.
+         This function can be used to import/export dashboards between multiple
+         caravel instances. Audit metadata isn't copies over.
+        """
+        session = db.session
+        make_transient(datasource_to_import)
+        logging.info('Started import of the datasource: {}'
+                     .format(datasource_to_import.to_json()))
+
+        datasource_to_import.id = None
+        database_name = datasource_to_import.params_dict['database_name']
+        datasource_to_import.database_id = session.query(Database).filter_by(
+            database_name=database_name).one().id
+        datasource_to_import.alter_params(import_time=import_time)
+
+        # override the datasource
+        datasource = (
+            session.query(SqlaTable).join(Database)
+            .filter(
+                SqlaTable.table_name == datasource_to_import.table_name,
+                SqlaTable.schema == datasource_to_import.schema,
+                Database.id == datasource_to_import.database_id,
+            )
+            .first()
+        )
+
+        if datasource:
+            datasource.override(datasource_to_import)
+            session.flush()
+        else:
+            datasource = datasource_to_import.copy()
+            session.add(datasource)
+            session.flush()
+
+        for m in datasource_to_import.metrics:
+            new_m = m.copy()
+            new_m.table_id = datasource.id
+            logging.info('Importing metric {} from the datasource: {}'.format(
+                new_m.to_json(), datasource_to_import.full_name))
+            imported_m = SqlMetric.import_obj(new_m)
+            if imported_m not in datasource.metrics:
+                datasource.metrics.append(imported_m)
+
+        for c in datasource_to_import.columns:
+            new_c = c.copy()
+            new_c.table_id = datasource.id
+            logging.info('Importing column {} from the datasource: {}'.format(
+                new_c.to_json(), datasource_to_import.full_name))
+            imported_c = TableColumn.import_obj(new_c)
+            if imported_c not in datasource.columns:
+                datasource.columns.append(imported_c)
+        db.session.flush()
+
+        return datasource.id
+
+
+class SqlMetric(Model, AuditMixinNullable, ImportMixin):
 
     """ORM object for metrics, each table can have multiple metrics"""
 
@@ -866,10 +1327,17 @@ class SqlMetric(Model, AuditMixinNullable):
     metric_type = Column(String(32))
     table_id = Column(Integer, ForeignKey('tables.id'))
     table = relationship(
-        'SqlaTable', backref='metrics', foreign_keys=[table_id])
+        'SqlaTable',
+        backref=backref('metrics', cascade='all, delete-orphan'),
+        foreign_keys=[table_id])
     expression = Column(Text)
     description = Column(Text)
     is_restricted = Column(Boolean, default=False, nullable=True)
+    d3format = Column(String(128))
+
+    export_fields = (
+        'metric_name', 'verbose_name', 'metric_type', 'table_id', 'expression',
+        'description', 'is_restricted', 'd3format')
 
     @property
     def sqla_col(self):
@@ -883,8 +1351,28 @@ class SqlMetric(Model, AuditMixinNullable):
         ).format(obj=self,
                  parent_name=self.table.full_name) if self.table else None
 
+    @classmethod
+    def import_obj(cls, metric_to_import):
+        session = db.session
+        make_transient(metric_to_import)
+        metric_to_import.id = None
 
-class TableColumn(Model, AuditMixinNullable):
+        # find if the column was already imported
+        existing_metric = session.query(SqlMetric).filter(
+            SqlMetric.table_id == metric_to_import.table_id,
+            SqlMetric.metric_name == metric_to_import.metric_name).first()
+        metric_to_import.table = None
+        if existing_metric:
+            existing_metric.override(metric_to_import)
+            session.flush()
+            return existing_metric
+
+        session.add(metric_to_import)
+        session.flush()
+        return metric_to_import
+
+
+class TableColumn(Model, AuditMixinNullable, ImportMixin):
 
     """ORM object for table columns, each table can have multiple columns"""
 
@@ -892,7 +1380,9 @@ class TableColumn(Model, AuditMixinNullable):
     id = Column(Integer, primary_key=True)
     table_id = Column(Integer, ForeignKey('tables.id'))
     table = relationship(
-        'SqlaTable', backref='columns', foreign_keys=[table_id])
+        'SqlaTable',
+        backref=backref('columns', cascade='all, delete-orphan'),
+        foreign_keys=[table_id])
     column_name = Column(String(255))
     verbose_name = Column(String(1024))
     is_dttm = Column(Boolean, default=False)
@@ -901,6 +1391,7 @@ class TableColumn(Model, AuditMixinNullable):
     groupby = Column(Boolean, default=False)
     count_distinct = Column(Boolean, default=False)
     sum = Column(Boolean, default=False)
+    avg = Column(Boolean, default=False)
     max = Column(Boolean, default=False)
     min = Column(Boolean, default=False)
     filterable = Column(Boolean, default=False)
@@ -912,6 +1403,12 @@ class TableColumn(Model, AuditMixinNullable):
     num_types = ('DOUBLE', 'FLOAT', 'INT', 'BIGINT', 'LONG')
     date_types = ('DATE', 'TIME')
     str_types = ('VARCHAR', 'STRING', 'CHAR')
+    export_fields = (
+        'table_id', 'column_name', 'verbose_name', 'is_dttm', 'is_active',
+        'type', 'groupby', 'count_distinct', 'sum', 'avg', 'max', 'min',
+        'filterable', 'expression', 'description', 'python_date_format',
+        'database_expression'
+    )
 
     def __repr__(self):
         return self.column_name
@@ -937,38 +1434,48 @@ class TableColumn(Model, AuditMixinNullable):
             col = literal_column(self.expression).label(name)
         return col
 
-    def dttm_sql_literal(self, dttm):
-        """Convert datetime object to string
+    @classmethod
+    def import_obj(cls, column_to_import):
+        session = db.session
+        make_transient(column_to_import)
+        column_to_import.id = None
+        column_to_import.table = None
 
-        If datebase_expression is empty, the internal dttm
+        # find if the column was already imported
+        existing_column = session.query(TableColumn).filter(
+            TableColumn.table_id == column_to_import.table_id,
+            TableColumn.column_name == column_to_import.column_name).first()
+        column_to_import.table = None
+        if existing_column:
+            existing_column.override(column_to_import)
+            session.flush()
+            return existing_column
+
+        session.add(column_to_import)
+        session.flush()
+        return column_to_import
+
+    def dttm_sql_literal(self, dttm):
+        """Convert datetime object to a SQL expression string
+
+        If database_expression is empty, the internal dttm
         will be parsed as the string with the pattern that
-        user input (python_date_format)
+        the user inputted (python_date_format)
         If database_expression is not empty, the internal dttm
-        will be parsed as the sql sentence for datebase to convert
+        will be parsed as the sql sentence for the database to convert
         """
+
         tf = self.python_date_format or '%Y-%m-%d %H:%M:%S.%f'
         if self.database_expression:
             return self.database_expression.format(dttm.strftime('%Y-%m-%d %H:%M:%S'))
         elif tf == 'epoch_s':
             return str((dttm - datetime(1970, 1, 1)).total_seconds())
         elif tf == 'epoch_ms':
-            return str((dttm - datetime(1970, 1, 1)).total_seconds()*1000.0)
+            return str((dttm - datetime(1970, 1, 1)).total_seconds() * 1000.0)
         else:
-            default = "'{}'".format(dttm.strftime(tf))
-            iso = dttm.isoformat()
-            d = {
-                'mssql': "CONVERT(DATETIME, '{}', 126)".format(iso),  # untested
-                'mysql': default,
-                'oracle':
-                    """TO_TIMESTAMP('{}', 'YYYY-MM-DD"T"HH24:MI:SS.ff6')""".format(
-                        dttm.isoformat()),
-                'presto': default,
-                'sqlite': default,
-            }
-            for k, v in d.items():
-                if self.table.database.sqlalchemy_uri.startswith(k):
-                    return v
-            return default
+            s = self.table.database.db_engine_spec.convert_dttm(
+                self.type, dttm)
+            return s or "'{}'".format(dttm.strftime(tf))
 
 
 class DruidCluster(Model, AuditMixinNullable):
@@ -976,6 +1483,7 @@ class DruidCluster(Model, AuditMixinNullable):
     """ORM object referencing the Druid clusters"""
 
     __tablename__ = 'clusters'
+
     id = Column(Integer, primary_key=True)
     cluster_name = Column(String(250), unique=True)
     coordinator_host = Column(String(255))
@@ -986,6 +1494,7 @@ class DruidCluster(Model, AuditMixinNullable):
     broker_port = Column(Integer)
     broker_endpoint = Column(String(255), default='druid/v2')
     metadata_last_refreshed = Column(DateTime)
+    cache_timeout = Column(Integer)
 
     def __repr__(self):
         return self.cluster_name
@@ -1016,6 +1525,14 @@ class DruidCluster(Model, AuditMixinNullable):
             if datasource not in config.get('DRUID_DATA_SOURCE_BLACKLIST'):
                 DruidDatasource.sync_to_db(datasource, self)
 
+    @property
+    def perm(self):
+        return "[{obj.cluster_name}].(id:{obj.id})".format(obj=self)
+
+    @property
+    def name(self):
+        return self.cluster_name
+
 
 class DruidDatasource(Model, AuditMixinNullable, Queryable):
 
@@ -1033,7 +1550,10 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
     description = Column(Text)
     default_endpoint = Column(Text)
     user_id = Column(Integer, ForeignKey('ab_user.id'))
-    owner = relationship('User', backref='datasources', foreign_keys=[user_id])
+    owner = relationship(
+        'User',
+        backref=backref('datasources', cascade='all, delete-orphan'),
+        foreign_keys=[user_id])
     cluster_name = Column(
         String(250), ForeignKey('clusters.cluster_name'))
     cluster = relationship(
@@ -1042,10 +1562,18 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
     cache_timeout = Column(Integer)
 
     @property
+    def database(self):
+        return self.cluster
+
+    @property
     def metrics_combo(self):
         return sorted(
             [(m.metric_name, m.verbose_name) for m in self.metrics],
             key=lambda x: x[1])
+
+    @property
+    def database(self):
+        return self.cluster
 
     @property
     def num_cols(self):
@@ -1063,15 +1591,25 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
 
     @property
     def link(self):
-        return (
-            '<a href="{self.url}">'
-            '{self.datasource_name}</a>').format(**locals())
+        name = escape(self.datasource_name)
+        return Markup('<a href="{self.url}">{name}</a>').format(**locals())
 
     @property
     def full_name(self):
-        return (
-            "[{obj.cluster_name}]."
-            "[{obj.datasource_name}]").format(obj=self)
+        return utils.get_datasource_full_name(
+            self.cluster_name, self.datasource_name)
+
+    @property
+    def time_column_grains(self):
+        return {
+            "time_columns": [
+                'all', '5 seconds', '30 seconds', '1 minute',
+                '5 minutes', '1 hour', '6 hour', '1 day', '7 days',
+                'week', 'week_starting_sunday', 'week_ending_saturday',
+                'month',
+            ],
+            "time_grains": ['now']
+        }
 
     def __repr__(self):
         return self.datasource_name
@@ -1079,8 +1617,8 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
     @renders('datasource_name')
     def datasource_link(self):
         url = "/caravel/explore/{obj.type}/{obj.id}/".format(obj=self)
-        return '<a href="{url}">{obj.datasource_name}</a>'.format(
-            url=url, obj=self)
+        name = escape(self.datasource_name)
+        return Markup('<a href="{url}">{name}</a>'.format(**locals()))
 
     def get_metric_obj(self, metric_name):
         return [
@@ -1106,7 +1644,7 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
         def int_or_0(v):
             try:
                 v = int(v)
-            except Exception as e:
+            except (TypeError, ValueError):
                 v = 0
             return v
         v1nums = [int_or_0(n) for n in v1.split('.')]
@@ -1141,6 +1679,79 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
     def generate_metrics(self):
         for col in self.columns:
             col.generate_metrics()
+
+    @classmethod
+    def sync_to_db_from_config(cls, druid_config, user, cluster):
+        """Merges the ds config from druid_config into one stored in the db."""
+        session = db.session()
+        datasource = (
+            session.query(DruidDatasource)
+            .filter_by(
+                datasource_name=druid_config['name'])
+        ).first()
+        # Create a new datasource.
+        if not datasource:
+            datasource = DruidDatasource(
+                datasource_name=druid_config['name'],
+                cluster=cluster,
+                owner=user,
+                changed_by_fk=user.id,
+                created_by_fk=user.id,
+            )
+            session.add(datasource)
+
+        dimensions = druid_config['dimensions']
+        for dim in dimensions:
+            col_obj = (
+                session.query(DruidColumn)
+                .filter_by(
+                    datasource_name=druid_config['name'],
+                    column_name=dim)
+            ).first()
+            if not col_obj:
+                col_obj = DruidColumn(
+                    datasource_name=druid_config['name'],
+                    column_name=dim,
+                    groupby=True,
+                    filterable=True,
+                    # TODO: fetch type from Hive.
+                    type="STRING",
+                    datasource=datasource
+                )
+                session.add(col_obj)
+        # Import Druid metrics
+        for metric_spec in druid_config["metrics_spec"]:
+            metric_name = metric_spec["name"]
+            metric_type = metric_spec["type"]
+            metric_json = json.dumps(metric_spec)
+
+            if metric_type == "count":
+                metric_type = "longSum"
+                metric_json = json.dumps({
+                    "type": "longSum",
+                    "name": metric_name,
+                    "fieldName": metric_name,
+                })
+
+            metric_obj = (
+                session.query(DruidMetric)
+                .filter_by(
+                    datasource_name=druid_config['name'],
+                    metric_name=metric_name)
+            ).first()
+            if not metric_obj:
+                metric_obj = DruidMetric(
+                    metric_name=metric_name,
+                    metric_type=metric_type,
+                    verbose_name="%s(%s)" % (metric_type, metric_name),
+                    datasource=datasource,
+                    json=metric_json,
+                    description=(
+                        "Imported from the airolap config dir for %s" %
+                        druid_config['name']),
+                )
+                session.add(metric_obj)
+        session.commit()
 
     @classmethod
     def sync_to_db(cls, name, cluster):
@@ -1184,6 +1795,60 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
             col_obj.generate_metrics()
             session.flush()
 
+    @staticmethod
+    def time_offset(granularity):
+        if granularity == 'week_ending_saturday':
+            return 6 * 24 * 3600 * 1000  # 6 days
+        return 0
+
+    # uses https://en.wikipedia.org/wiki/ISO_8601
+    # http://druid.io/docs/0.8.0/querying/granularities.html
+    # TODO: pass origin from the UI
+    @staticmethod
+    def granularity(period_name, timezone=None, origin=None):
+        if not period_name or period_name == 'all':
+            return 'all'
+        iso_8601_dict = {
+            '5 seconds': 'PT5S',
+            '30 seconds': 'PT30S',
+            '1 minute': 'PT1M',
+            '5 minutes': 'PT5M',
+            '1 hour': 'PT1H',
+            '6 hour': 'PT6H',
+            'one day': 'P1D',
+            '1 day': 'P1D',
+            '7 days': 'P7D',
+            'week': 'P1W',
+            'week_starting_sunday': 'P1W',
+            'week_ending_saturday': 'P1W',
+            'month': 'P1M',
+        }
+
+        granularity = {'type': 'period'}
+        if timezone:
+            granularity['timezone'] = timezone
+
+        if origin:
+            dttm = utils.parse_human_datetime(origin)
+            granularity['origin'] = dttm.isoformat()
+
+        if period_name in iso_8601_dict:
+            granularity['period'] = iso_8601_dict[period_name]
+            if period_name in ('week_ending_saturday', 'week_starting_sunday'):
+                # use Sunday as start of the week
+                granularity['origin'] = '2016-01-03T00:00:00'
+        elif not isinstance(period_name, string_types):
+            granularity['type'] = 'duration'
+            granularity['duration'] = period_name
+        elif period_name.startswith('P'):
+            # identify if the string is the iso_8601 period
+            granularity['period'] = period_name
+        else:
+            granularity['type'] = 'duration'
+            granularity['duration'] = utils.parse_human_timedelta(
+                period_name).total_seconds() * 1000
+        return granularity
+
     def query(  # druid
             self, groupby, metrics,
             granularity,
@@ -1191,6 +1856,7 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
             filter=None,  # noqa
             is_timeseries=True,
             timeseries_limit=None,
+            timeseries_limit_metric=None,
             row_limit=None,
             inner_from_dttm=None, inner_to_dttm=None,
             orderby=None,
@@ -1203,18 +1869,22 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
         """
         # TODO refactor into using a TBD Query object
         qry_start_dttm = datetime.now()
-
+        if not is_timeseries:
+            granularity = 'all'
         inner_from_dttm = inner_from_dttm or from_dttm
         inner_to_dttm = inner_to_dttm or to_dttm
 
         # add tzinfo to native datetime with config
         from_dttm = from_dttm.replace(tzinfo=config.get("DRUID_TZ"))
         to_dttm = to_dttm.replace(tzinfo=config.get("DRUID_TZ"))
+        timezone = from_dttm.tzname()
 
         query_str = ""
         metrics_dict = {m.metric_name: m for m in self.metrics}
         all_metrics = []
         post_aggs = {}
+
+        columns_dict = {c.column_name: c for c in self.columns}
 
         def recursive_get_fields(_conf):
             _fields = _conf.get('fields', [])
@@ -1225,7 +1895,6 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
                     field_names.append(_f.get('fieldName'))
                 elif _type == 'arithmetic':
                     field_names += recursive_get_fields(_f)
-
             return list(set(field_names))
 
         for metric_name in metrics:
@@ -1247,11 +1916,10 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
                         conf.get('fields', []),
                         conf.get('name', ''))
 
-        aggregations = {
-            m.metric_name: m.json_obj
-            for m in self.metrics
-            if m.metric_name in all_metrics
-        }
+        aggregations = OrderedDict()
+        for m in self.metrics:
+            if m.metric_name in all_metrics:
+                aggregations[m.metric_name] = m.json_obj
 
         rejected_metrics = [
             m.metric_name for m in self.metrics
@@ -1263,24 +1931,27 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
         if rejected_metrics:
             raise MetricPermException(
                 "Access to the metrics denied: " + ', '.join(rejected_metrics)
-        )
+            )
 
-        granularity = granularity or "all"
-        if granularity != "all":
-            granularity = utils.parse_human_timedelta(
-                granularity).total_seconds() * 1000
-        if not isinstance(granularity, string_types):
-            granularity = {"type": "duration", "duration": granularity}
-            origin = extras.get('druid_time_origin')
-            if origin:
-                dttm = utils.parse_human_datetime(origin)
-                granularity['origin'] = dttm.isoformat()
-
+        # the dimensions list with dimensionSpecs expanded
+        dimensions = []
+        groupby = [gb for gb in groupby if gb in columns_dict]
+        for column_name in groupby:
+            col = columns_dict.get(column_name)
+            dim_spec = col.dimension_spec
+            if dim_spec:
+                dimensions.append(dim_spec)
+            else:
+                dimensions.append(column_name)
         qry = dict(
             datasource=self.datasource_name,
-            dimensions=groupby,
+            dimensions=dimensions,
             aggregations=aggregations,
-            granularity=granularity,
+            granularity=DruidDatasource.granularity(
+                granularity,
+                timezone=timezone,
+                origin=extras.get('druid_time_origin'),
+            ),
             post_aggregations=post_aggs,
             intervals=from_dttm.isoformat() + '/' + to_dttm.isoformat(),
         )
@@ -1295,60 +1966,78 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
 
         client = self.cluster.get_pydruid_client()
         orig_filters = filters
-        if timeseries_limit and is_timeseries:
-            # Limit on the number of timeseries, doing a two-phases query
-            pre_qry = deepcopy(qry)
-            pre_qry['granularity'] = "all"
-            pre_qry['limit_spec'] = {
-                "type": "default",
-                "limit": timeseries_limit,
-                'intervals': (
-                    inner_from_dttm.isoformat() + '/' +
-                    inner_to_dttm.isoformat()),
-                "columns": [{
-                    "dimension": metrics[0] if metrics else self.metrics[0],
-                    "direction": "descending",
-                }],
-            }
-            client.groupby(**pre_qry)
-            query_str += "// Two phase query\n// Phase 1\n"
-            query_str += json.dumps(
-                client.query_builder.last_query.query_dict, indent=2) + "\n"
-            query_str += "//\nPhase 2 (built based on phase one's results)\n"
-            df = client.export_pandas()
-            if df is not None and not df.empty:
-                dims = qry['dimensions']
-                filters = []
-                for unused, row in df.iterrows():
-                    fields = []
-                    for dim in dims:
-                        f = Dimension(dim) == row[dim]
-                        fields.append(f)
-                    if len(fields) > 1:
-                        filt = Filter(type="and", fields=fields)
-                        filters.append(filt)
-                    elif fields:
-                        filters.append(fields[0])
+        if len(groupby) == 0:
+            del qry['dimensions']
+            client.timeseries(**qry)
+        if len(groupby) == 1:
+            qry['threshold'] = timeseries_limit or 1000
+            if row_limit and granularity == 'all':
+                qry['threshold'] = row_limit
+            qry['dimension'] = list(qry.get('dimensions'))[0]
+            del qry['dimensions']
+            qry['metric'] = list(qry['aggregations'].keys())[0]
+            client.topn(**qry)
+        elif len(groupby) > 1:
+            if timeseries_limit and is_timeseries:
+                order_by = metrics[0] if metrics else self.metrics[0]
+                if timeseries_limit_metric:
+                    order_by = timeseries_limit_metric
+                # Limit on the number of timeseries, doing a two-phases query
+                pre_qry = deepcopy(qry)
+                pre_qry['granularity'] = "all"
+                pre_qry['limit_spec'] = {
+                    "type": "default",
+                    "limit": timeseries_limit,
+                    'intervals': (
+                        inner_from_dttm.isoformat() + '/' +
+                        inner_to_dttm.isoformat()),
+                    "columns": [{
+                        "dimension": order_by,
+                        "direction": "descending",
+                    }],
+                }
+                client.groupby(**pre_qry)
+                query_str += "// Two phase query\n// Phase 1\n"
+                query_str += json.dumps(
+                    client.query_builder.last_query.query_dict, indent=2)
+                query_str += "\n"
+                query_str += (
+                    "//\nPhase 2 (built based on phase one's results)\n")
+                df = client.export_pandas()
+                if df is not None and not df.empty:
+                    dims = qry['dimensions']
+                    filters = []
+                    for unused, row in df.iterrows():
+                        fields = []
+                        for dim in dims:
+                            f = Dimension(dim) == row[dim]
+                            fields.append(f)
+                        if len(fields) > 1:
+                            filt = Filter(type="and", fields=fields)
+                            filters.append(filt)
+                        elif fields:
+                            filters.append(fields[0])
 
-                if filters:
-                    ff = Filter(type="or", fields=filters)
-                    if not orig_filters:
-                        qry['filter'] = ff
-                    else:
-                        qry['filter'] = Filter(type="and", fields=[
-                            ff,
-                            orig_filters])
-                qry['limit_spec'] = None
-        if row_limit:
-            qry['limit_spec'] = {
-                "type": "default",
-                "limit": row_limit,
-                "columns": [{
-                    "dimension": metrics[0] if metrics else self.metrics[0],
-                    "direction": "descending",
-                }],
-            }
-        client.groupby(**qry)
+                    if filters:
+                        ff = Filter(type="or", fields=filters)
+                        if not orig_filters:
+                            qry['filter'] = ff
+                        else:
+                            qry['filter'] = Filter(type="and", fields=[
+                                ff,
+                                orig_filters])
+                    qry['limit_spec'] = None
+            if row_limit:
+                qry['limit_spec'] = {
+                    "type": "default",
+                    "limit": row_limit,
+                    "columns": [{
+                        "dimension": (
+                            metrics[0] if metrics else self.metrics[0]),
+                        "direction": "descending",
+                    }],
+                }
+            client.groupby(**qry)
         query_str += json.dumps(
             client.query_builder.last_query.query_dict, indent=2)
         df = client.export_pandas()
@@ -1368,6 +2057,16 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
         cols += [col for col in groupby if col in df.columns]
         cols += [col for col in metrics if col in df.columns]
         df = df[cols]
+
+        time_offset = DruidDatasource.time_offset(granularity)
+
+        def increment_timestamp(ts):
+            dt = utils.parse_human_datetime(ts).replace(
+                tzinfo=config.get("DRUID_TZ"))
+            return dt + timedelta(milliseconds=time_offset)
+        if 'timestamp' in df.columns and time_offset:
+            df.timestamp = df.timestamp.apply(increment_timestamp)
+
         return QueryResult(
             df=df,
             query=query_str,
@@ -1384,9 +2083,11 @@ class DruidDatasource(Model, AuditMixinNullable, Queryable):
                 cond = ~(Dimension(col) == eq)
             elif op in ('in', 'not in'):
                 fields = []
-                splitted = eq.split(',')
-                if len(splitted) > 1:
-                    for s in eq.split(','):
+                # Distinguish quoted values with regular value types
+                splitted = FillterPattern.split(eq)[1::2]
+                values = [types.replace("'", '') for types in splitted]
+                if len(values) > 1:
+                    for s in values:
                         s = s.strip()
                         fields.append(Dimension(col) == s)
                     cond = Filter(type="or", fields=fields)
@@ -1468,10 +2169,18 @@ class Log(Model):
             d = request.args.to_dict()
             d.update(kwargs)
             slice_id = d.get('slice_id', 0)
-            slice_id = int(slice_id) if slice_id else 0
+            try:
+                slice_id = int(slice_id) if slice_id else 0
+            except ValueError:
+                slice_id = 0
+            params = ""
+            try:
+                params = json.dumps(d)
+            except:
+                pass
             log = cls(
                 action=f.__name__,
-                json=json.dumps(d),
+                json=params,
                 dashboard_id=d.get('dashboard_id') or None,
                 slice_id=slice_id,
                 user_id=user_id)
@@ -1491,14 +2200,17 @@ class DruidMetric(Model, AuditMixinNullable):
     verbose_name = Column(String(1024))
     metric_type = Column(String(32))
     datasource_name = Column(
-        String(250),
+        String(255),
         ForeignKey('datasources.datasource_name'))
     # Setting enable_typechecks=False disables polymorphic inheritance.
-    datasource = relationship('DruidDatasource', backref='metrics',
-                              enable_typechecks=False)
+    datasource = relationship(
+        'DruidDatasource',
+        backref=backref('metrics', cascade='all, delete-orphan'),
+        enable_typechecks=False)
     json = Column(Text)
     description = Column(Text)
     is_restricted = Column(Boolean, default=False, nullable=True)
+    d3format = Column(String(128))
 
     @property
     def json_obj(self):
@@ -1524,21 +2236,25 @@ class DruidColumn(Model, AuditMixinNullable):
     __tablename__ = 'columns'
     id = Column(Integer, primary_key=True)
     datasource_name = Column(
-        String(250),
+        String(255),
         ForeignKey('datasources.datasource_name'))
     # Setting enable_typechecks=False disables polymorphic inheritance.
-    datasource = relationship('DruidDatasource', backref='columns',
-                              enable_typechecks=False)
+    datasource = relationship(
+        'DruidDatasource',
+        backref=backref('columns', cascade='all, delete-orphan'),
+        enable_typechecks=False)
     column_name = Column(String(255))
     is_active = Column(Boolean, default=True)
     type = Column(String(32))
     groupby = Column(Boolean, default=False)
     count_distinct = Column(Boolean, default=False)
     sum = Column(Boolean, default=False)
+    avg = Column(Boolean, default=False)
     max = Column(Boolean, default=False)
     min = Column(Boolean, default=False)
     filterable = Column(Boolean, default=False)
     description = Column(Text)
+    dimension_spec_json = Column(Text)
 
     def __repr__(self):
         return self.column_name
@@ -1546,6 +2262,11 @@ class DruidColumn(Model, AuditMixinNullable):
     @property
     def isnum(self):
         return self.type in ('LONG', 'DOUBLE', 'FLOAT', 'INT')
+
+    @property
+    def dimension_spec(self):
+        if self.dimension_spec_json:
+            return json.loads(self.dimension_spec_json)
 
     def generate_metrics(self):
         """Generate metrics based on the column metadata"""
@@ -1573,6 +2294,18 @@ class DruidColumn(Model, AuditMixinNullable):
                 json=json.dumps({
                     'type': mt, 'name': name, 'fieldName': self.column_name})
             ))
+
+        if self.avg and self.isnum:
+            mt = corrected_type.lower() + 'Avg'
+            name = 'avg__' + self.column_name
+            metrics.append(DruidMetric(
+                metric_name=name,
+                metric_type='avg',
+                verbose_name='AVG({})'.format(self.column_name),
+                json=json.dumps({
+                    'type': mt, 'name': name, 'fieldName': self.column_name})
+            ))
+
         if self.min and self.isnum:
             mt = corrected_type.lower() + 'Min'
             name = 'min__' + self.column_name
@@ -1644,3 +2377,177 @@ class FavStar(Model):
     class_name = Column(String(50))
     obj_id = Column(Integer)
     dttm = Column(DateTime, default=func.now())
+
+
+class QueryStatus:
+    CANCELLED = 'cancelled'
+    FAILED = 'failed'
+    PENDING = 'pending'
+    RUNNING = 'running'
+    SCHEDULED = 'scheduled'
+    SUCCESS = 'success'
+    TIMED_OUT = 'timed_out'
+
+
+class Query(Model):
+
+    """ORM model for SQL query"""
+
+    __tablename__ = 'query'
+    id = Column(Integer, primary_key=True)
+    client_id = Column(String(11), unique=True, nullable=False)
+
+    database_id = Column(Integer, ForeignKey('dbs.id'), nullable=False)
+
+    # Store the tmp table into the DB only if the user asks for it.
+    tmp_table_name = Column(String(256))
+    user_id = Column(
+        Integer, ForeignKey('ab_user.id'), nullable=True)
+    status = Column(String(16), default=QueryStatus.PENDING)
+    tab_name = Column(String(256))
+    sql_editor_id = Column(String(256))
+    schema = Column(String(256))
+    sql = Column(Text)
+    # Query to retrieve the results,
+    # used only in case of select_as_cta_used is true.
+    select_sql = Column(Text)
+    executed_sql = Column(Text)
+    # Could be configured in the caravel config.
+    limit = Column(Integer)
+    limit_used = Column(Boolean, default=False)
+    limit_reached = Column(Boolean, default=False)
+    select_as_cta = Column(Boolean)
+    select_as_cta_used = Column(Boolean, default=False)
+
+    progress = Column(Integer, default=0)  # 1..100
+    # # of rows in the result set or rows modified.
+    rows = Column(Integer)
+    error_message = Column(Text)
+    # key used to store the results in the results backend
+    results_key = Column(String(64))
+
+    # Using Numeric in place of DateTime for sub-second precision
+    # stored as seconds since epoch, allowing for milliseconds
+    start_time = Column(Numeric(precision=3))
+    end_time = Column(Numeric(precision=3))
+    changed_on = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=True)
+
+    database = relationship(
+        'Database', foreign_keys=[database_id], backref='queries')
+    user = relationship(
+        'User',
+        backref=backref('queries', cascade='all, delete-orphan'),
+        foreign_keys=[user_id])
+
+    __table_args__ = (
+        sqla.Index('ti_user_id_changed_on', user_id, changed_on),
+    )
+
+    @property
+    def limit_reached(self):
+        return self.rows == self.limit if self.limit_used else False
+
+    def to_dict(self):
+        return {
+            'changedOn': self.changed_on,
+            'changed_on': self.changed_on.isoformat(),
+            'dbId': self.database_id,
+            'db': self.database.database_name,
+            'endDttm': self.end_time,
+            'errorMessage': self.error_message,
+            'executedSql': self.executed_sql,
+            'id': self.client_id,
+            'limit': self.limit,
+            'progress': self.progress,
+            'rows': self.rows,
+            'schema': self.schema,
+            'ctas': self.select_as_cta,
+            'serverId': self.id,
+            'sql': self.sql,
+            'sqlEditorId': self.sql_editor_id,
+            'startDttm': self.start_time,
+            'state': self.status.lower(),
+            'tab': self.tab_name,
+            'tempTable': self.tmp_table_name,
+            'userId': self.user_id,
+            'user': self.user.username,
+            'limit_reached': self.limit_reached,
+            'resultsKey': self.results_key,
+        }
+
+    @property
+    def name(self):
+        ts = datetime.now().isoformat()
+        ts = ts.replace('-', '').replace(':', '').split('.')[0]
+        tab = self.tab_name.replace(' ', '_').lower() if self.tab_name else 'notab'
+        tab = re.sub(r'\W+', '', tab)
+        return "sqllab_{tab}_{ts}".format(**locals())
+
+
+class DatasourceAccessRequest(Model, AuditMixinNullable):
+    """ORM model for the access requests for datasources and dbs."""
+    __tablename__ = 'access_request'
+    id = Column(Integer, primary_key=True)
+
+    datasource_id = Column(Integer)
+    datasource_type = Column(String(200))
+
+    ROLES_BLACKLIST = set(['Admin', 'Alpha', 'Gamma', 'Public'])
+
+    @property
+    def cls_model(self):
+        return SourceRegistry.sources[self.datasource_type]
+
+    @property
+    def username(self):
+        return self.creator()
+
+    @property
+    def datasource(self):
+        return self.get_datasource
+
+    @datasource.getter
+    @utils.memoized
+    def get_datasource(self):
+        ds = db.session.query(self.cls_model).filter_by(
+            id=self.datasource_id).first()
+        return ds
+
+    @property
+    def datasource_link(self):
+        return self.datasource.link
+
+    @property
+    def roles_with_datasource(self):
+        action_list = ''
+        pv = sm.find_permission_view_menu(
+            'datasource_access', self.datasource.perm)
+        for r in pv.role:
+            if r.name in self.ROLES_BLACKLIST:
+                continue
+            url = (
+                '/caravel/approve?datasource_type={self.datasource_type}&'
+                'datasource_id={self.datasource_id}&'
+                'created_by={self.created_by.username}&role_to_grant={r.name}'
+                .format(**locals())
+            )
+            href = '<a href="{}">Grant {} Role</a>'.format(url, r.name)
+            action_list = action_list + '<li>' + href + '</li>'
+        return '<ul>' + action_list + '</ul>'
+
+    @property
+    def user_roles(self):
+        action_list = ''
+        for r in self.created_by.roles:
+            url = (
+                '/caravel/approve?datasource_type={self.datasource_type}&'
+                'datasource_id={self.datasource_id}&'
+                'created_by={self.created_by.username}&role_to_extend={r.name}'
+                .format(**locals())
+            )
+            href = '<a href="{}">Extend {} Role</a>'.format(url, r.name)
+            if r.name in self.ROLES_BLACKLIST:
+                href = "{} Role".format(r.name)
+            action_list = action_list + '<li>' + href + '</li>'
+        return '<ul>' + action_list + '</ul>'
